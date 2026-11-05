@@ -1,0 +1,582 @@
+{
+  "name": "Send weekly hotel summary",
+  "description": "Every Monday, turns last week's hotel sheet into a personal summary email for each owner, replacing a slow, error-prone manual report (FUNNOW assignment). Rules decide, AI rewords, code checks.",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "4348bbf1-f6fe-4199-b16e-380786ae61b9",
+      "name": "Run Manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Sheet1"
+        },
+        "options": {}
+      },
+      "id": "0161b62e-8635-4f2a-8642-bc428ce1b775",
+      "name": "Read Hotel Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        224,
+        0
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "fabdacc8-2b94-4267-907d-dd559bb4de51",
+      "name": "Check Sheet Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const REQUIRED_COLUMNS = ['brandname', 'revenue', 'Order', 'Boss Gmail', 'week_start'];\nconst isBlank = (value) => value === '' || value === null || value === undefined;\n\nconst rows = $input.all().map((item) => item.json);\n\n// 1. Every column the rule needs must exist.\nconst missing = REQUIRED_COLUMNS.filter((column) => !(column in (rows[0] ?? {})));\nif (missing.length > 0) {\n  throw new Error(`Sheet is missing column(s): ${missing.join(', ')}`);\n}\n\n// 2. A hotel row has at least one number or an email. This drops blank rows and the note in row 14,\n//    but keeps a real hotel with a missing email so the next step can send it for review.\nconst hotels = rows.filter((row) => !isBlank(row.revenue) || !isBlank(row.Order) || !isBlank(row['Boss Gmail']));\nif (hotels.length === 0) {\n  throw new Error('Sheet has no hotel rows');\n}\n\n// 3. The data must be last week's. Weeks start on Monday.\nconst expectedWeek = $now.startOf('week').minus({ weeks: 1 }).toISODate();\nconst foundWeeks = [...new Set(hotels.map((row) => String(row.week_start)))];\nif (foundWeeks.length !== 1 || foundWeeks[0] !== expectedWeek) {\n  throw new Error(`Sheet is not last week's data: expected week_start ${expectedWeek}, found ${foundWeeks.join(', ')}`);\n}\n\nreturn hotels.map((json) => ({ json }));\n"
+      },
+      "notes": "Stops the whole run if the sheet can't be trusted (missing columns, no hotels, not last week's data). Passes on hotel rows only, which drops blank rows and the free-text note."
+    },
+    {
+      "id": "079979b2-2f86-4f7d-a3b4-f69b0304406a",
+      "name": "Apply Label Rule",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const BELOW_SHARE = 0.6;   // below 60% of the peer median = below usual\nconst ABOVE_SHARE = 1.4;   // above 140% of the peer median = above usual (same distance from the median)\nconst MIN_PEERS = 5;       // with fewer hotels the comparison means little, so a person decides\n\nconst hotels = $input.all().map((item) => item.json);\nconst isBlank = (value) => value === '' || value === null || value === undefined;\n\n// Why a row can't be labelled automatically. null means the row is fine.\nfunction findProblem(hotel) {\n  const email = String(hotel['Boss Gmail'] ?? '').trim();\n  if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)) return 'Owner email is missing or invalid';\n  if (typeof hotel.revenue !== 'number' || typeof hotel.Order !== 'number') return 'Revenue or orders is not a number';\n  if (hotel.revenue < 0 || hotel.Order < 0) return 'Revenue or orders is negative';\n  if (hotel.revenue === 0 || hotel.Order === 0) return 'Revenue or orders is zero';\n  if (!isBlank(hotel.target_revenue) && !(typeof hotel.target_revenue === 'number' && hotel.target_revenue > 0)) return 'Target is not a valid number';\n  return null;\n}\n\nfunction median(values) {\n  const sorted = [...values].sort((a, b) => a - b);\n  const middle = Math.floor(sorted.length / 2);\n  return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;\n}\n\nfunction band(value, peerMedian) {\n  if (value < peerMedian * BELOW_SHARE) return 'below';\n  if (value > peerMedian * ABOVE_SHARE) return 'above';\n  return 'in_range';\n}\n\nconst problems = hotels.map(findProblem);\n\n// Medians use normal rows only, so one bad row can't move the line for everyone.\nconst peers = hotels.filter((hotel, index) => problems[index] === null);\nconst enoughPeers = peers.length >= MIN_PEERS;\nconst revenueMedian = enoughPeers ? median(peers.map((hotel) => hotel.revenue)) : null;\nconst ordersMedian = enoughPeers ? median(peers.map((hotel) => hotel.Order)) : null;\nconst perOrderMedian = enoughPeers ? median(peers.map((hotel) => hotel.revenue / hotel.Order)) : null;\n\nreturn hotels.map((hotel, index) => {\n  let reviewReason = problems[index];\n  if (reviewReason === null && !enoughPeers) reviewReason = `Fewer than ${MIN_PEERS} hotels to compare`;\n  const canCompare = reviewReason === null;\n  const hasTarget = canCompare && !isBlank(hotel.target_revenue);\n\n  // Only revenue decides the label: against the hotel's own target if it has one, otherwise against the group.\n  // Orders and revenue per order explain the result.\n  let revenueStatus = null;\n  if (hasTarget) revenueStatus = hotel.revenue >= hotel.target_revenue ? 'met' : 'missed';\n  else if (canCompare) revenueStatus = band(hotel.revenue, revenueMedian);\n\n  const isLow = revenueStatus === 'below' || revenueStatus === 'missed';\n  const label = !canCompare ? 'review' : isLow ? 'needs_improvement' : 'good';\n\n  const canDivide = typeof hotel.revenue === 'number' && typeof hotel.Order === 'number' && hotel.Order > 0;\n\n  return {\n    json: {\n      hotel: hotel.brandname,\n      revenue: hotel.revenue,\n      orders: hotel.Order,\n      revenue_per_order: canDivide ? Math.round(hotel.revenue / hotel.Order) : null,\n      owner_email: hotel['Boss Gmail'],\n      week_start: hotel.week_start,\n      label,\n      review_reason: reviewReason,\n      revenue_status: revenueStatus,\n      orders_status: canCompare ? band(hotel.Order, ordersMedian) : null,\n      revenue_per_order_status: canCompare ? band(hotel.revenue / hotel.Order, perOrderMedian) : null,\n      target_revenue: hasTarget ? hotel.target_revenue : null,\n      // Rounded down, so a hotel just short of its target never shows 100%.\n      target_percent: hasTarget ? Math.floor((hotel.revenue / hotel.target_revenue) * 100) : null,\n    },\n  };\n});\n"
+      },
+      "notes": "Locked rule: revenue below 60% of the peer median = needs_improvement, otherwise good. Abnormal rows go to a person and are left out of the median. Code node because the median needs all hotels at once.",
+      "alwaysOutputData": false
+    },
+    {
+      "id": "d9dd5c27-664a-40d1-88a8-8a453d565639",
+      "name": "Can AI Write This?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        896,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.label }}",
+              "rightValue": "review",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Hotels labelled review never reach the AI. The false branch goes to a person (wired in the sending step)."
+    },
+    {
+      "id": "a6f41626-4b87-462f-b3bb-96cb97bf9b09",
+      "name": "Add Approved Wording",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1120,
+        -100
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": true,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "approved-point",
+              "name": "approved_point",
+              "type": "string",
+              "value": "={{ ({ below: 'Revenue is below the usual range for this group.', in_range: 'Revenue is within the usual range for this group.', above: 'Revenue is above the usual range for this group.', met: 'Revenue reached the target for this period.', missed: 'Revenue is below the target for this period.' })[$json.revenue_status] + ' Orders are ' + ({ below: 'below usual', in_range: 'in range', above: 'above usual' })[$json.orders_status] + '. Revenue per order is ' + ({ below: 'below usual', in_range: 'in range', above: 'above usual' })[$json.revenue_per_order_status] + '.' }}"
+            },
+            {
+              "id": "approved-next-step",
+              "name": "approved_next_step",
+              "type": "string",
+              "value": "={{ $json.orders_status === 'below' ? \"Check that next week's prices in FunNow Manager still match what you want to sell.\" : $json.revenue_per_order_status === 'below' ? 'Review which packages and prices guests are choosing.' : $json.label === 'needs_improvement' ? \"Check that next week's prices in FunNow Manager still match what you want to sell.\" : 'Check which offers sold best and keep them available.' }}"
+            }
+          ]
+        },
+        "options": {},
+        "notes": "Rules write the facts as a plain fallback sentence and pick the next step. The AI turns the same facts into natural wording; there are too many status combinations to template well."
+      },
+      "notes": "Our own wording, chosen by the label. The AI rewords it; the fallback template uses it as is."
+    },
+    {
+      "id": "2bdaf144-feac-4666-9910-9b21813cb8a1",
+      "name": "Write Summary with AI",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1344,
+        -100
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "=Revenue: {{ ({ below: 'below usual', in_range: 'in range', above: 'above usual', met: 'reached the target', missed: 'below the target' })[$json.revenue_status] }}\nOrders: {{ ({ below: 'below usual', in_range: 'in range', above: 'above usual' })[$json.orders_status] }}\nRevenue per order: {{ ({ below: 'below usual', in_range: 'in range', above: 'above usual' })[$json.revenue_per_order_status] }}\nApproved next step: {{ $json.approved_next_step }}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "You write the short summary in a weekly email from FunNow to a hotel owner. Software adds the hotel name, the figures and the closing note. You are given how three measures compare with all partner hotels this period, and one approved next step. Write two parts:\n- summary: one sentence, or two if needed. Say the revenue result first, then what stands out in orders and revenue per order. A table right below it shows every status, so keep it short and do not repeat yourself. If all three are in range, say so once.\n- next_step: one sentence that starts with a verb and invites the owner to try the approved next step.\n\nRules:\n- Say only what the facts say. Add no new facts.\n- Name each measure with its own status. Never change a status.\n- Write no numbers, in digits or in words, and no percentages.\n- Mention a target only if the facts mention one.\n- Do not mention hotel names, rankings, earlier periods, occupancy, room rates or forecasts.\n- Do not call the hotels similar. The group is all partner hotels.\n- Do not say why a result happened, or that one measure caused another.\n- Describe the result, not the person. Never say the owner failed or did badly.\n- Do not offer praise unless revenue is above usual or reached the target.\n- Use plain English, under 35 words in total, with no emoji and no markdown.\n\nExample with revenue above usual, orders above usual, revenue per order in range:\nsummary: Your revenue is above the usual range for this group, and orders are above usual too.\nnext_step: Look at which offers sold best and keep them available.\n\nExample with revenue below usual, orders in range, revenue per order below usual:\nsummary: Your revenue is below the usual range for this group, while orders are in range and revenue per order is below usual.\nnext_step: Review which packages and prices guests are choosing.\n\nExample with all three in range:\nsummary: Your revenue, orders and revenue per order are all in the usual range for this group.\nnext_step: Look at which offers sold best and keep them available."
+            }
+          ]
+        },
+        "batching": {
+          "batchSize": 1,
+          "delayBetweenBatches": 2000
+        },
+        "notes": "The AI gets status words only and never sees hotel names or figures. If this call fails, the next step uses the plain template."
+      },
+      "notes": "The AI only rewords approved text and never sees hotel names or figures. If this call fails, the next step uses the template."
+    },
+    {
+      "id": "bd98d135-831b-4e48-8028-f181cb5bae91",
+      "name": "Gemini Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1296,
+        120
+      ],
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash-lite",
+        "options": {
+          "maxOutputTokens": 512
+        }
+      },
+      "credentials": {
+        "googlePalmApi": {
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "id": "ddd1ec80-2283-40c7-b089-e52edbecfebe",
+      "name": "Summary Format",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        1456,
+        120
+      ],
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\"},\"next_step\":{\"type\":\"string\"}},\"required\":[\"summary\",\"next_step\"],\"additionalProperties\":false}"
+      },
+      "notes": "No auto-fix on purpose: a bad answer goes to the template, which costs no extra AI call."
+    },
+    {
+      "id": "2da81c68-75fc-4337-ad1b-2459ee204b94",
+      "name": "Check AI Draft and Build Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1664,
+        -100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_CHARS = 300;\nconst SUBJECT_LEAD = { below: 'Worth a closer look', missed: 'Below target', in_range: 'In the usual range', above: 'Above the usual range', met: 'Target met' };\nconst STATUS_TEXT = { below: 'Below usual', missed: 'Below target', in_range: 'In range', above: 'Above usual', met: 'Target met' };\n// Orange rather than red: below usual means lower than this group this week, not bad performance.\nconst STATUS_COLOR = { below: '#C2410C', missed: '#C2410C', in_range: '#5F6368', above: '#137333', met: '#137333' };\nconst NEUTRAL_COLOR = '#5F6368';\n\n// Word lists catch what they list. An indirect sentence can still pass, so needs-improvement emails still go to a person.\nconst BANNED = [\n  ['a number', /[0-9๐-๙０-９%]|\\b(hundred|thousand|million|billion|percent|half|double|twice)\\b/i],\n  ['a leftover placeholder', /[{}\\[\\]]/],\n  // The group is every partner hotel in the sheet, not hotels like this one, so similar is a false claim.\n  ['data we do not have', /\\b(last week|previous|compared (with|to)|similar|comparable|occupancy|adr|revpar|room rate|forecast)\\b/i],\n  ['a ranking', /\\b(highest|lowest|ranked?|leading|top of)\\b/i],\n  ['a made-up cause', /\\b(because|due to|caused|driven|thanks to|result of|leads? to|led to|reason|seasons?|seasonal|weather|holidays?|competitors?|as a result)\\b/i],\n  ['blame', /\\b(fail\\w*|poor\\w*|bad\\w*|terrible|disappoint\\w*)\\b/i],\n];\nconst PRAISE = /\\b(great|excellent|congrat\\w*|well done|outstanding|fantastic|impressive)\\b/i;\nconst WARNING = /\\b(improve\\w*|concern\\w*|closer look|worry\\w*)\\b/i;\n\nconst LOW_WORDS = /\\b(below|under|low\\w*|less|fewer|weak\\w*|short)\\b/i;\nconst HIGH_WORDS = /\\b(above|over|high\\w*|more|exceed\\w*|beat\\w*|strong\\w*)\\b/i;\nconst USUAL_WORDS = /\\b(in range|in the usual|within|usual range|normal|typical)\\b/i;\nconst DIRECTION_OF_STATUS = { below: 'low', missed: 'low', in_range: 'usual', above: 'high', met: 'high' };\n\nfunction directionOf(text) {\n  if (LOW_WORDS.test(text)) return 'low';\n  if (HIGH_WORDS.test(text)) return 'high';\n  if (USUAL_WORDS.test(text)) return 'usual';\n  return null;\n}\n\nfunction measureOf(text) {\n  if (/revenue per order/i.test(text)) return 'revenue_per_order_status';\n  if (/\\borders?\\b/i.test(text)) return 'orders_status';\n  if (/\\brevenue\\b/i.test(text)) return 'revenue_status';\n  return null;\n}\n\n// Does each part of the summary say what the rules decided about that measure?\nfunction findWrongStatuses(summary, hotel) {\n  const problems = [];\n  const directions = ['revenue_status', 'orders_status', 'revenue_per_order_status'].map((key) => DIRECTION_OF_STATUS[hotel[key]]);\n  if (LOW_WORDS.test(summary) && !directions.includes('low')) problems.push('summary says something is low, but nothing is');\n  if (HIGH_WORDS.test(summary) && !directions.includes('high')) problems.push('summary says something is high, but nothing is');\n  for (const part of summary.split(/[.;,:!?]|\\b(?:but|while|and|though|although|however|with|yet)\\b/i)) {\n    const measure = measureOf(part);\n    const direction = directionOf(part);\n    if (measure && direction && direction !== DIRECTION_OF_STATUS[hotel[measure]]) {\n      problems.push(`summary gives the wrong status for ${measure.replace('_status', '').replace(/_/g, ' ')}`);\n    }\n  }\n  return problems;\n}\n\n// The distinctive parts of a hotel name: Chinese name, and English name without generic words like Inn.\nfunction namesOf(brandname) {\n  const parts = String(brandname).split(' ');\n  const english = parts.slice(1).join(' ').replace(/\\s+(Inn|Hotel|Hostel|Resort|Biz)$/i, '');\n  return [parts[0], english].filter(Boolean);\n}\n\nfunction findProblems(draft, hotel, otherNames) {\n  if (!draft) return ['AI gave no usable answer'];\n  const problems = [];\n  const praiseAllowed = hotel.revenue_status === 'above' || hotel.revenue_status === 'met';\n  for (const field of ['summary', 'next_step']) {\n    const text = draft[field];\n    if (typeof text !== 'string' || text.trim() === '') { problems.push(`${field} is missing`); continue; }\n    if (text.length > MAX_CHARS) problems.push(`${field} is too long`);\n    for (const [name, pattern] of BANNED) if (pattern.test(text)) problems.push(`${field} has ${name}`);\n    if (hotel.target_revenue === null && /\\b(target|goal)\\b/i.test(text)) problems.push(`${field} mentions a target this hotel does not have`);\n    if (!praiseAllowed && PRAISE.test(text)) problems.push(`${field} has praise that does not match the result`);\n    if (hotel.label === 'good' && WARNING.test(text)) problems.push(`${field} has a warning that does not match the result`);\n    if (otherNames.some((name) => text.toLowerCase().includes(name.toLowerCase()))) problems.push(`${field} names another hotel`);\n  }\n  if (typeof draft.summary === 'string') problems.push(...findWrongStatuses(draft.summary, hotel));\n  return problems;\n}\n\nconst escapeHtml = (text) => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst formatNumber = (value) => value.toLocaleString('en-US');\n\nfunction figureRow(name, value, badgeText, badgeColor) {\n  const badge = `<span style=\"display:inline-block;padding:2px 8px;border-radius:10px;background-color:${badgeColor};color:#ffffff;font-size:13px;white-space:nowrap\">${badgeText}</span>`;\n  return `<tr><td style=\"padding:6px 8px 6px 0;border-bottom:1px solid #999\">${name}</td>`\n    + `<td align=\"right\" style=\"padding:6px 12px;border-bottom:1px solid #999;white-space:nowrap\">${formatNumber(value)}</td>`\n    + `<td style=\"padding:6px 0;border-bottom:1px solid #999;white-space:nowrap\">${badge}</td></tr>`;\n}\n\nconst statusRow = (name, value, status) => figureRow(name, value, STATUS_TEXT[status], STATUS_COLOR[status]);\n\nfunction closingNote(hotel) {\n  const comparison = hotel.target_revenue === null\n    ? 'Compared with partner hotels for one week.'\n    : 'Revenue is compared with your target. Orders and revenue per order are compared with partner hotels for one week.';\n  return `${comparison} Room count and hotel type are not included. Reply if a figure looks wrong.`;\n}\n\n// Colour only on the status badges, each with its own white text, so dark mode can't hide them.\nfunction buildEmail(hotel, summary, nextStep, period) {\n  const targetRow = hotel.target_revenue === null\n    ? ''\n    : figureRow('Target', hotel.target_revenue, `${hotel.target_percent}% reached`, NEUTRAL_COLOR);\n  return `<div style=\"font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.5;max-width:480px\">`\n    + `<p style=\"margin:0\"><strong>${escapeHtml(hotel.hotel)}</strong></p>`\n    + `<p style=\"margin:0 0 16px\">${period}</p>`\n    + `<p style=\"margin:0 0 16px\">${escapeHtml(summary)}</p>`\n    + `<table cellpadding=\"0\" cellspacing=\"0\" style=\"border-collapse:collapse;width:100%;margin:0 0 16px\">`\n    + statusRow('Revenue', hotel.revenue, hotel.revenue_status)\n    + targetRow\n    + statusRow('Orders', hotel.orders, hotel.orders_status)\n    + statusRow('Revenue per order', hotel.revenue_per_order, hotel.revenue_per_order_status)\n    + `</table>`\n    + `<p style=\"margin:0 0 16px\"><strong>One thing to try:</strong> ${escapeHtml(nextStep)}</p>`\n    + `<p style=\"margin:0;font-size:13px\">${closingNote(hotel)}</p>`\n    + `</div>`;\n}\n\nconst hotels = $('Add Approved Wording').all().map((item) => item.json);\nconst allNames = $('Apply Label Rule').all().map((item) => item.json.hotel);\n\nreturn $input.all().map((item, index) => {\n  const hotel = hotels[item.pairedItem?.item ?? index];\n  const otherNames = allNames.filter((name) => name !== hotel.hotel).flatMap(namesOf);\n\n  const start = DateTime.fromISO(hotel.week_start).setLocale('en');\n  const period = `${start.toFormat('d LLL')} - ${start.plus({ days: 6 }).toFormat('d LLL yyyy')}`;\n\n  const draft = item.json.output;\n  const problems = findProblems(draft, hotel, otherNames);\n  const usedTemplate = problems.length > 0;\n\n  const body = usedTemplate\n    ? buildEmail(hotel, hotel.approved_point, hotel.approved_next_step, period)\n    : buildEmail(hotel, draft.summary.trim(), draft.next_step.trim(), period);\n\n  // Last guard: every number the reader sees must be this hotel's own figure, part of its name, or part of the date.\n  const visibleText = body.replace(/<[^>]*>/g, ' ').replace(/(\\d),(?=\\d)/g, '$1');\n  const allowed = new Set(\n    [hotel.revenue, hotel.orders, hotel.revenue_per_order, hotel.target_revenue, hotel.target_percent].filter((value) => value !== null).map(String)\n      .concat(period.match(/\\d+/g), String(hotel.hotel).match(/\\d+/g) ?? [])\n  );\n  const strayNumbers = (visibleText.match(/\\d+/g) ?? []).filter((number) => !allowed.has(number));\n  if (strayNumbers.length > 0) {\n    throw new Error(`${hotel.hotel}: email has numbers that are not in the data: ${strayNumbers.join(', ')}`);\n  }\n\n  const labelNote = hotel.revenue_status === 'missed' ? 'Revenue is below the target.' : 'Revenue is below the usual range.';\n\n  return {\n    json: {\n      hotel: hotel.hotel,\n      owner_email: hotel.owner_email,\n      label: hotel.label,\n      subject: `${SUBJECT_LEAD[hotel.revenue_status]} | ${hotel.hotel}`,\n      body,\n      summary_text: usedTemplate ? hotel.approved_point : draft.summary.trim(),\n      used_template: usedTemplate,\n      check_problems: problems,\n      needs_review: hotel.label !== 'good' || usedTemplate,\n      review_note: usedTemplate ? `AI draft failed the check (${problems.join('; ')}), so this uses the template.` : labelNote,\n    },\n    pairedItem: item.pairedItem,\n  };\n});\n"
+      },
+      "notes": "Code, not another AI, decides if the draft is safe. Any problem means the template is used and a person reviews the email. Needs all hotels to catch other hotels' names."
+    },
+    {
+      "id": "64bcb20b-17a8-4f04-ad76-bc5a79e5c6ba",
+      "name": "Needs Human Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2112,
+        -100
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.needs_review }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Good results with a passing AI draft go straight to the owner. Needs-improvement results and template emails go to a person first."
+    },
+    {
+      "id": "ef392f50-db9d-4c73-9b44-ad2ba26cefaf",
+      "name": "Send to Reviewer",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2336,
+        -200
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "reviewer@example.com",
+        "subject": "=[REVIEW] {{ $json.subject }}",
+        "emailType": "html",
+        "message": "=<p style=\"font-family:Arial,Helvetica,sans-serif;font-size:13px;margin:0 0 16px\"><strong>For review.</strong> Intended for {{ $json.owner_email || 'no valid address' }}. Reason: {{ $json.review_note }}</p><hr>{{ $json.body }}",
+        "options": {
+          "appendAttribution": false,
+          "senderName": "Hotel Weekly Report"
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": false,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "ff29f7eb-0eeb-4161-8dfe-830c7644ef95",
+      "name": "Send to Hotel Owner",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2336,
+        0
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $json.owner_email }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "html",
+        "message": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false,
+          "senderName": "Hotel Weekly Report"
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": false,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "432ae0e0-eec7-483b-b83a-92096d2adc04",
+      "name": "Build Data Check Notice",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1120,
+        200
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "notice-subject",
+              "name": "subject",
+              "type": "string",
+              "value": "=Check the data | {{ $json.hotel }}"
+            },
+            {
+              "id": "notice-owner",
+              "name": "owner_email",
+              "type": "string",
+              "value": "={{ $json.owner_email }}"
+            },
+            {
+              "id": "notice-note",
+              "name": "review_note",
+              "type": "string",
+              "value": "={{ $json.review_reason }}. No email was written for the owner."
+            },
+            {
+              "id": "notice-body",
+              "name": "body",
+              "type": "string",
+              "value": "=<div style=\"font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.5\"><p style=\"margin:0 0 16px\"><strong>{{ $json.hotel }}</strong></p><p style=\"margin:0 0 16px\">Revenue: {{ $json.revenue }}<br>Orders: {{ $json.orders }}</p><p style=\"margin:0\">Please check this row in the sheet. The system can't tell why it looks wrong, for example if the hotel was closed or the data is missing.</p></div>"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Hotels with data we can't trust get no AI text and no owner email. A person checks the sheet instead."
+    },
+    {
+      "id": "65c0ea40-4a36-4b88-aa0b-988160b32f1f",
+      "name": "Every Monday 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        -180
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeksInterval": 1,
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 9,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "notes": "Bangkok time, set in the workflow settings. Runs only while this computer and n8n are on."
+    }
+  ],
+  "connections": {
+    "Run Manually": {
+      "main": [
+        [
+          {
+            "node": "Read Hotel Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Hotel Sheet": {
+      "main": [
+        [
+          {
+            "node": "Check Sheet Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Sheet Data": {
+      "main": [
+        [
+          {
+            "node": "Apply Label Rule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Label Rule": {
+      "main": [
+        [
+          {
+            "node": "Can AI Write This?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Can AI Write This?": {
+      "main": [
+        [
+          {
+            "node": "Add Approved Wording",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Data Check Notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Approved Wording": {
+      "main": [
+        [
+          {
+            "node": "Write Summary with AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Write Summary with AI",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summary Format": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Write Summary with AI",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Summary with AI": {
+      "main": [
+        [
+          {
+            "node": "Check AI Draft and Build Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Human Review?": {
+      "main": [
+        [
+          {
+            "node": "Send to Reviewer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send to Hotel Owner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check AI Draft and Build Email": {
+      "main": [
+        [
+          {
+            "node": "Needs Human Review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Data Check Notice": {
+      "main": [
+        [
+          {
+            "node": "Send to Reviewer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every Monday 09:00": {
+      "main": [
+        [
+          {
+            "node": "Read Hotel Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "binaryMode": "separate",
+    "timezone": "Asia/Bangkok"
+  },
+  "nodeGroups": [
+    {
+      "id": "93104628-deee-47ac-8579-bf0108a235cf",
+      "name": "Read sheet and label hotels",
+      "nodeIds": [
+        "0161b62e-8635-4f2a-8642-bc428ce1b775",
+        "fabdacc8-2b94-4267-907d-dd559bb4de51",
+        "079979b2-2f86-4f7d-a3b4-f69b0304406a"
+      ],
+      "description": "Reads the sheet, stops if the data can't be trusted, then rules label each hotel. No AI here."
+    },
+    {
+      "id": "a9b9a68e-0c84-4108-b1f1-38b2363ccdb5",
+      "name": "AI writes, code checks",
+      "nodeIds": [
+        "a6f41626-4b87-462f-b3bb-96cb97bf9b09",
+        "2bdaf144-feac-4666-9910-9b21813cb8a1",
+        "bd98d135-831b-4e48-8028-f181cb5bae91",
+        "ddd1ec80-2283-40c7-b089-e52edbecfebe",
+        "2da81c68-75fc-4337-ad1b-2459ee204b94"
+      ],
+      "description": "AI words the status facts. Code rejects bad drafts and falls back to a plain template."
+    }
+  ]
+}

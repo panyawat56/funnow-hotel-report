@@ -1,0 +1,63 @@
+{
+  "name": "Alert when hotel report fails",
+  "description": "Emails the owner when the weekly hotel report stops, saying what broke and whether any emails already went out. Without it a failed Monday run would go unnoticed, because the report runs unattended.",
+  "nodes": [
+    {
+      "id": "2d729371-0912-4b04-bab4-02b424c85733",
+      "name": "When Report Fails",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "9779cacc-1e30-4f30-9108-dc88ec04f4e5",
+      "name": "Email Failure Alert",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        224,
+        0
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "reviewer@example.com",
+        "subject": "=[ALERT] Stopped: {{ $json.workflow.name }}",
+        "emailType": "text",
+        "message": "=This run stopped before it finished.\n\nWhat went wrong: {{ $json.execution?.error?.message ?? $json.trigger?.error?.message ?? \"Unknown error\" }}\nStopped at: {{ $json.execution?.lastNodeExecuted ?? \"Unknown step\" }}\n\n{{ [\"Read Hotel Sheet\", \"Check Sheet Data\", \"Apply Label Rule\", \"Can AI Write This?\", \"Add Approved Wording\", \"Write Summary with AI\", \"Check AI Draft and Build Email\", \"Needs Human Review?\"].includes($json.execution?.lastNodeExecuted) ? \"No emails went out in this run.\" : \"Some emails may already have gone out. Check the Sent folder before running it again.\" }}\n\nOpen this run: {{ $json.execution?.url ?? \"No link available\" }}",
+        "options": {
+          "appendAttribution": false,
+          "senderName": "Hotel Weekly Report"
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      },
+      "notes": "Plain text on purpose: error messages can contain sheet values. Uses the same Gmail account as the report, so if Gmail itself is down this alert fails too."
+    }
+  ],
+  "connections": {
+    "When Report Fails": {
+      "main": [
+        [
+          {
+            "node": "Email Failure Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true
+  },
+  "nodeGroups": []
+}
