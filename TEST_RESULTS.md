@@ -1,6 +1,6 @@
 # Test results
 
-These are the results of runs on 5 November 2026, using `gemini-3.5-flash-lite` and the mock data supplied with the assignment. The numbers come from one person's testing and one week of data. They show what was tried, and they don't prove the system never makes a mistake.
+These are the results of runs on 5 and 8 November 2026, using `gemini-3.5-flash-lite` and the mock data supplied with the assignment. The numbers come from one person's testing and one week of data. They show what was tried, and they don't prove the system never makes a mistake.
 
 ## Bad data
 
@@ -36,8 +36,8 @@ Each draft below was inserted in place of the AI's answer. The check caught all 
 
 | Measure | Result |
 |---|---|
-| Runs inspected | 5 |
-| Drafts | 45 |
+| Runs inspected | 6 |
+| Drafts | 54 |
 | Rejected by the check, so the template was used | 2 |
 | Wrong sentences that passed the check | 2 |
 
@@ -54,8 +54,9 @@ A word list can only catch what it lists, which is why needs-improvement emails 
 
 | Test | Result |
 |---|---|
-| Full run on the mock sheet | 10 emails sent: 5 to owner addresses and 5 to the reviewer |
+| Full run on the mock sheet, 5 Nov | 10 emails sent: 5 to owner addresses and 5 to the reviewer |
+| Full run with the latest version, 8 Nov | 10 emails sent: 6 to owner addresses and 4 to the reviewer. All 9 AI drafts passed the check, so no template was used |
 | Wrong date in the sheet, with the workflow live | The run stopped before any report email, and the alert workflow ran |
-| Run time with AI calls | 46 seconds to 5 minutes for 10 hotels |
+| Run time with AI calls | 46 seconds to 5 minutes for 10 hotels (74 seconds on 8 Nov) |
 
-The full run used an earlier version of the AI prompt. The latest version has only been tested with the send steps switched off.
+The 5 Nov full run used an earlier version of the AI prompt. The 8 Nov run used the latest version and was started by hand for the demo video; the schedule is set for every Monday at 09:00.
